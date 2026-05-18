@@ -32,12 +32,17 @@ from .task_manager import TaskManager
 logger = logging.getLogger(__name__)
 
 
-def _get_avoma_client():
-    """Lazily import to avoid crashing when AVOMA_API_KEY is not set."""
+def _get_avoma_source():
+    """
+    Return the appropriate Avoma data source:
+      - AvomaClient  if AVOMA_API_KEY is set  (API key path)
+      - AvomaScraper if AVOMA_EMAIL+PASSWORD are set (credential path)
+      - None         if Avoma is not configured
+    """
     if not Config.avoma_enabled():
         return None
-    from .avoma_client import AvomaClient  # noqa: PLC0415
-    return AvomaClient()
+    from .avoma_scraper import get_avoma_source  # noqa: PLC0415
+    return get_avoma_source()
 
 
 def _today_range_utc() -> tuple[datetime, datetime]:
@@ -64,25 +69,24 @@ def _yesterday_range_utc() -> tuple[datetime, datetime]:
 def morning_job() -> None:
     logger.info("Running morning job...")
     tm = TaskManager()
-    avoma = _get_avoma_client()
+    avoma = _get_avoma_source()
     today_iso = date.today().isoformat()
 
     # Pull today's meetings from Avoma
     meetings = []
     if avoma:
-        try:
-            from_dt, to_dt = _today_range_utc()
-            meetings = avoma.list_meetings(from_dt, to_dt)
-            logger.info("Fetched %d meetings from Avoma", len(meetings))
-        except Exception:
-            logger.warning("Failed to fetch Avoma meetings", exc_info=True)
-
-    # Also import action items from yesterday's completed meetings (if any are new)
-    if avoma:
-        try:
-            _import_avoma_action_items(avoma, tm, *_yesterday_range_utc(), tag_date=today_iso)
-        except Exception:
-            logger.warning("Failed to import Avoma action items", exc_info=True)
+        with _avoma_ctx(avoma) as src:
+            try:
+                from_dt, to_dt = _today_range_utc()
+                meetings = src.list_meetings(from_dt, to_dt)
+                logger.info("Fetched %d meetings from Avoma", len(meetings))
+            except Exception:
+                logger.warning("Failed to fetch Avoma meetings", exc_info=True)
+            # Also import action items from yesterday's completed meetings
+            try:
+                _import_avoma_action_items(src, tm, *_yesterday_range_utc(), tag_date=today_iso)
+            except Exception:
+                logger.warning("Failed to import Avoma action items", exc_info=True)
 
     # Fetch today's tasks
     tasks = tm.list_tasks(due_date=today_iso, include_completed=False)
@@ -97,24 +101,23 @@ def morning_job() -> None:
 def evening_job() -> None:
     logger.info("Running evening job...")
     tm = TaskManager()
-    avoma = _get_avoma_client()
+    avoma = _get_avoma_source()
     today_iso = date.today().isoformat()
 
     # Pull today's completed meetings and action items
     meetings = []
     action_items = []
     if avoma:
-        try:
-            from_dt, to_dt = _today_range_utc()
-            meetings = avoma.list_meetings(from_dt, to_dt)
-            logger.info("Fetched %d meetings from Avoma", len(meetings))
-            # Import action items as tasks so they appear in task lists
-            new_count = _import_avoma_action_items(avoma, tm, from_dt, to_dt, tag_date=today_iso)
-            logger.info("Imported %d new Avoma action items", new_count)
-            # Collect for the email summary
-            action_items = avoma.extract_todays_action_items(from_dt, to_dt)
-        except Exception:
-            logger.warning("Failed to fetch Avoma data", exc_info=True)
+        with _avoma_ctx(avoma) as src:
+            try:
+                from_dt, to_dt = _today_range_utc()
+                meetings = src.list_meetings(from_dt, to_dt)
+                logger.info("Fetched %d meetings from Avoma", len(meetings))
+                new_count = _import_avoma_action_items(src, tm, from_dt, to_dt, tag_date=today_iso)
+                logger.info("Imported %d new Avoma action items", new_count)
+                action_items = src.extract_todays_action_items(from_dt, to_dt)
+            except Exception:
+                logger.warning("Failed to fetch Avoma data", exc_info=True)
 
     # All tasks for today (including completed)
     tasks = tm.list_tasks(due_date=today_iso, include_completed=True)
@@ -130,18 +133,21 @@ def avoma_sync_job() -> None:
     """Hourly job: import new action items from completed Avoma calls."""
     if not Config.avoma_enabled():
         return
-    logger.info("Running hourly Avoma sync...")
+    logger.info("Running hourly Avoma sync (mode=%s)...", Config.avoma_mode())
     tm = TaskManager()
-    from .avoma_client import AvomaClient  # noqa: PLC0415
-    avoma = AvomaClient()
+    from .avoma_scraper import get_avoma_source  # noqa: PLC0415
+    avoma = get_avoma_source()
+    if avoma is None:
+        return
     today_iso = date.today().isoformat()
     from_dt, to_dt = _today_range_utc()
-    try:
-        count = _import_avoma_action_items(avoma, tm, from_dt, to_dt, tag_date=today_iso)
-        if count:
-            logger.info("Avoma sync: imported %d new action items", count)
-    except Exception:
-        logger.warning("Avoma sync failed", exc_info=True)
+    with _avoma_ctx(avoma) as src:
+        try:
+            count = _import_avoma_action_items(src, tm, from_dt, to_dt, tag_date=today_iso)
+            if count:
+                logger.info("Avoma sync: imported %d new action items", count)
+        except Exception:
+            logger.warning("Avoma sync failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -240,3 +246,21 @@ def run_scheduler() -> None:
 def _parse_time(t: str) -> tuple[int, int]:
     h, m = t.strip().split(":")
     return int(h), int(m)
+
+
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def _avoma_ctx(source):
+    """
+    Unified context manager for both AvomaClient (no-op CM) and
+    AvomaScraper (needs browser open/close).
+    """
+    from .avoma_scraper import AvomaScraper  # noqa: PLC0415
+    if isinstance(source, AvomaScraper):
+        with source as s:
+            yield s
+    else:
+        # AvomaClient is a plain object — no context management needed
+        yield source

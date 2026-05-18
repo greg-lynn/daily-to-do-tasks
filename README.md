@@ -35,22 +35,40 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |---|---|---|
-| `AVOMA_API_KEY` | — | Avoma API key for transcript/action-item enrichment |
+| `AVOMA_API_KEY` | — | Avoma API key (admin path — see below) |
+| `AVOMA_EMAIL` | — | Your Avoma login email (non-admin path) |
+| `AVOMA_PASSWORD` | — | Your Avoma password (non-admin path) |
 | `MORNING_TIME` | `08:00` | Time to send morning email (24-hr, local TZ) |
 | `EVENING_TIME` | `18:00` | Time to send evening email |
 | `TIMEZONE` | `America/New_York` | Your IANA timezone |
 
-### 3. Get your Avoma API key
+### 3. Connect Avoma — pick one of two paths
 
-1. Log in to Avoma
-2. Go to **Settings → Organization → Developer**
-3. Create a new scoped key:
-   - **User – full access** for your own meetings
-   - **Organization – limited access** for all non-private org meetings
-4. Copy the key to `AVOMA_API_KEY` in your `.env`
+#### Path A: API key (you have Avoma admin access)
 
-> No scraping or raw password sharing required — the official Avoma REST API
-> ([dev.avoma.com](https://dev.avoma.com)) handles authentication securely via bearer token.
+1. Log in to Avoma → **Settings → Organization → Developer**
+2. Create a scoped key: **User – full access** (your calls) or **Organization – limited access** (all org calls)
+3. Set `AVOMA_API_KEY=<key>` in `.env`
+
+This is the fastest, most reliable option. If `AVOMA_API_KEY` is set it always takes priority.
+
+#### Path B: Email + password (no admin access required)
+
+If you **cannot generate an API key** because you don't have Avoma admin access, the app has a browser-based fallback. It launches a headless Chrome window, logs in to `app.avoma.com` with your credentials, and pulls meeting data directly using your authenticated session.
+
+```env
+AVOMA_EMAIL=glynn@rocketlane.com
+AVOMA_PASSWORD=your_avoma_password
+```
+
+The browser session is cached in `.avoma_session/` so subsequent runs skip the login step.
+
+> **SSO accounts (Google / Microsoft login):** If your Avoma account was created via SSO you won't have a standalone password. To enable Path B:
+> 1. Go to https://app.avoma.com/login and click **Forgot password**
+> 2. Set a standalone Avoma password
+> 3. Use that password as `AVOMA_PASSWORD`
+>
+> Alternatively, ask your Avoma admin to generate a user-scoped API key (Path A) tied to your account — they create the key and hand it to you; you don't need admin access yourself to *use* a key.
 
 ---
 
@@ -149,21 +167,28 @@ sudo systemctl status daily-todo
 
 ## How Avoma integration works
 
+The app auto-selects the mode based on which credentials are present in `.env`:
+
+| Mode | Triggered by | How it works |
+|---|---|---|
+| **API** | `AVOMA_API_KEY` is set | Direct REST calls to `api.avoma.com` |
+| **Scraper** | `AVOMA_EMAIL` + `AVOMA_PASSWORD` | Headless Chrome logs in and reuses session cookies |
+| **Disabled** | Neither set | Emails sent without Avoma data |
+
 ```
 Every hour (avoma_sync_job)
-    └─ List completed meetings in the last 24 h
-    └─ For each meeting with notes_ready=true
-        └─ Call GET /v1/meetings/{uuid}/insights/
-        └─ Extract ai_notes where note_type = action_item / next_step
+    └─ List completed meetings for today
+    └─ For each meeting with AI notes ready
+        └─ Fetch action items (via API or browser session)
         └─ Save each as a task (source=avoma, due_date=today)
         └─ Deduplication: skip if (meeting_uuid, title) already exists
 
 Morning email
-    └─ Today's meetings (state=scheduled) from Avoma
+    └─ Today's meetings from Avoma (scheduled + completed)
     └─ All pending tasks (manual + avoma-sourced)
 
 Evening email
-    └─ Today's completed meetings from Avoma
+    └─ Today's completed meetings
     └─ Fresh action-item extraction for the email summary
     └─ Full task list with completion status + progress bar
 ```
@@ -187,11 +212,13 @@ daily-to-do/
 ├── requirements.txt
 ├── .env.example         # Config template
 ├── src/
-│   ├── config.py        # Env-var config
-│   ├── avoma_client.py  # Avoma REST API wrapper
+│   ├── config.py        # Env-var config (API key vs credentials auto-detect)
+│   ├── avoma_client.py  # Avoma REST API wrapper (Path A)
+│   ├── avoma_scraper.py # Playwright browser scraper (Path B — no admin access)
 │   ├── task_manager.py  # SQLite task CRUD
 │   ├── email_sender.py  # HTML email builder + SMTP sender
 │   ├── scheduler.py     # APScheduler jobs
 │   └── cli.py           # Click CLI commands
+├── .avoma_session/      # Cached browser session (auto-created, git-ignored)
 └── tasks.db             # SQLite database (auto-created)
 ```

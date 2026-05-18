@@ -22,16 +22,19 @@ def _optional(key: str, default: str = "") -> str:
 
 
 class Config:
-    # Avoma
+    # Avoma — API key (admin-generated) OR email+password (credential-based scraper)
     AVOMA_API_KEY: str = _optional("AVOMA_API_KEY")
     AVOMA_BASE_URL: str = "https://api.avoma.com"
+    # Used when AVOMA_API_KEY is not available (non-admin workaround)
+    AVOMA_EMAIL: str = _optional("AVOMA_EMAIL")
+    AVOMA_PASSWORD: str = _optional("AVOMA_PASSWORD")
 
     # Email sending (SMTP)
     SMTP_HOST: str = _optional("SMTP_HOST", "smtp.gmail.com")
     SMTP_PORT: int = int(_optional("SMTP_PORT", "587"))
     SMTP_USER: str = _optional("SMTP_USER")
     SMTP_PASSWORD: str = _optional("SMTP_PASSWORD")
-    RECIPIENT_EMAIL: str = _optional("RECIPIENT_EMAIL")
+    RECIPIENT_EMAIL: str = _optional("RECIPIENT_EMAIL", "glynn@rocketlane.com")
 
     # Scheduling
     MORNING_TIME: str = _optional("MORNING_TIME", "08:00")   # HH:MM in local TZ
@@ -56,4 +59,13 @@ class Config:
 
     @classmethod
     def avoma_enabled(cls) -> bool:
-        return bool(cls.AVOMA_API_KEY)
+        return bool(cls.AVOMA_API_KEY) or bool(cls.AVOMA_EMAIL and cls.AVOMA_PASSWORD)
+
+    @classmethod
+    def avoma_mode(cls) -> str:
+        """Returns 'api', 'scraper', or 'disabled'."""
+        if cls.AVOMA_API_KEY:
+            return "api"
+        if cls.AVOMA_EMAIL and cls.AVOMA_PASSWORD:
+            return "scraper"
+        return "disabled"

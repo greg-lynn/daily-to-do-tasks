@@ -158,11 +158,15 @@ def stats() -> None:
 def sync_avoma(sync_date: str | None) -> None:
     """Pull action items from completed Avoma meetings and save as tasks."""
     if not Config.avoma_enabled():
-        click.echo("AVOMA_API_KEY is not set. Skipping sync.")
+        click.echo(
+            "Avoma is not configured.\n"
+            "Set AVOMA_API_KEY (preferred) or AVOMA_EMAIL + AVOMA_PASSWORD in your .env file."
+        )
         return
 
-    from .avoma_client import AvomaClient  # noqa: PLC0415
-    from .scheduler import _import_avoma_action_items, _today_range_utc  # noqa: PLC0415
+    from .avoma_scraper import get_avoma_source  # noqa: PLC0415
+    from .avoma_scraper import AvomaScraper       # noqa: PLC0415
+    from .scheduler import _import_avoma_action_items, _today_range_utc, _avoma_ctx  # noqa: PLC0415
     from datetime import datetime, time, timezone  # noqa: PLC0415
     import pytz  # noqa: PLC0415
 
@@ -176,9 +180,15 @@ def sync_avoma(sync_date: str | None) -> None:
     else:
         from_dt, to_dt = _today_range_utc()
 
-    avoma = AvomaClient()
+    mode = Config.avoma_mode()
+    click.echo(f"  Avoma mode: {mode}")
+    if mode == "scraper":
+        click.echo("  Using credential-based browser scraper (no API key) ...")
+
+    avoma = get_avoma_source()
     tm = _tm()
-    count = _import_avoma_action_items(avoma, tm, from_dt, to_dt, tag_date=tag_date)
+    with _avoma_ctx(avoma) as src:
+        count = _import_avoma_action_items(src, tm, from_dt, to_dt, tag_date=tag_date)
     click.echo(f"  Synced {count} new action items from Avoma for {tag_date}.")
 
 
@@ -216,8 +226,13 @@ def start_daemon() -> None:
         f"Starting scheduler — morning={Config.MORNING_TIME}, "
         f"evening={Config.EVENING_TIME}, tz={Config.TIMEZONE}"
     )
-    if not Config.avoma_enabled():
-        click.echo("  (Avoma integration disabled — set AVOMA_API_KEY to enable)")
+    mode = Config.avoma_mode()
+    if mode == "api":
+        click.echo("  Avoma: API key mode")
+    elif mode == "scraper":
+        click.echo("  Avoma: credential / browser scraper mode")
+    else:
+        click.echo("  Avoma: disabled (set AVOMA_API_KEY or AVOMA_EMAIL+AVOMA_PASSWORD)")
     run_scheduler()
 
 
