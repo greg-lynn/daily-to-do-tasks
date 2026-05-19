@@ -2,6 +2,7 @@
 Configuration loaded from environment variables / .env file.
 """
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -58,14 +59,32 @@ class Config:
             )
 
     @classmethod
+    def _avoma_session_exists(cls) -> bool:
+        """True when `avoma-login` has been run and a browser session is saved."""
+        from .avoma_scraper import SESSION_DIR, session_exists  # noqa: PLC0415
+        return session_exists()
+
+    @classmethod
     def avoma_enabled(cls) -> bool:
-        return bool(cls.AVOMA_API_KEY) or bool(cls.AVOMA_EMAIL and cls.AVOMA_PASSWORD)
+        return bool(cls.AVOMA_API_KEY) or cls.avoma_mode() == "scraper"
 
     @classmethod
     def avoma_mode(cls) -> str:
-        """Returns 'api', 'scraper', or 'disabled'."""
+        """
+        Returns 'api', 'scraper', or 'disabled'.
+
+        Scraper mode activates when ANY of the following is true:
+          - AVOMA_EMAIL + AVOMA_PASSWORD are both set (auto-login on first run)
+          - A saved browser session exists from a previous `avoma-login` run
+        """
         if cls.AVOMA_API_KEY:
             return "api"
         if cls.AVOMA_EMAIL and cls.AVOMA_PASSWORD:
             return "scraper"
+        # Check for a persisted browser session (set by `avoma-login`)
+        try:
+            if cls._avoma_session_exists():
+                return "scraper"
+        except Exception:
+            pass
         return "disabled"

@@ -2,8 +2,8 @@
 
 A Python app that:
 1. Lets you manage daily tasks via a CLI
-2. Connects to the **Avoma API** (using your API key — no scraping or raw login needed) to pull AI-generated action items from your call transcripts and automatically saves them as tasks
-3. Sends you a **morning email** with your upcoming meetings and pending tasks
+2. Connects to **Avoma** to pull AI-generated action items from your call transcripts and saves them as tasks
+3. Sends you a **morning email** with today's upcoming meetings and pending tasks
 4. Sends you an **evening email** with completed meetings, extracted action items, and your task progress
 
 ---
@@ -14,123 +14,129 @@ A Python app that:
 
 ```bash
 pip install -r requirements.txt
+python3 -m playwright install chromium   # installs the headless browser (~120 MB, one-time)
 ```
 
 ### 2. Configure
 
 ```bash
 cp .env.example .env
-# Edit .env with your values
+# Edit .env — fill in SMTP settings at minimum
 ```
 
-#### Required configuration
+#### Required
 
 | Variable | Description |
 |---|---|
 | `SMTP_USER` | Your sender email address |
 | `SMTP_PASSWORD` | Gmail App Password or SMTP credential |
-| `RECIPIENT_EMAIL` | Where daily emails are delivered |
+| `RECIPIENT_EMAIL` | Where daily emails are delivered (default: `glynn@rocketlane.com`) |
 
-#### Optional (but recommended)
+#### Optional — scheduling
 
 | Variable | Default | Description |
 |---|---|---|
-| `AVOMA_API_KEY` | — | Avoma API key (admin path — see below) |
-| `AVOMA_EMAIL` | — | Your Avoma login email (non-admin path) |
-| `AVOMA_PASSWORD` | — | Your Avoma password (non-admin path) |
 | `MORNING_TIME` | `08:00` | Time to send morning email (24-hr, local TZ) |
 | `EVENING_TIME` | `18:00` | Time to send evening email |
 | `TIMEZONE` | `America/New_York` | Your IANA timezone |
 
-### 3. Connect Avoma — pick one of two paths
+### 3. Connect Avoma — pick the easiest option
 
-#### Path A: API key (you have Avoma admin access)
+#### Option A: One-time browser login (recommended — works with Google/SSO)
 
-1. Log in to Avoma → **Settings → Organization → Developer**
-2. Create a scoped key: **User – full access** (your calls) or **Organization – limited access** (all org calls)
-3. Set `AVOMA_API_KEY=<key>` in `.env`
+Run this **once**:
 
-This is the fastest, most reliable option. If `AVOMA_API_KEY` is set it always takes priority.
+```bash
+python3 main.py avoma-login
+```
 
-#### Path B: Email + password (no admin access required)
+A real browser window opens. Click **Sign in with Google** exactly as you normally would in Avoma. Once you're past the login page, the window closes automatically and the session is saved. Every run after that is fully automated — nothing else to configure, no passwords stored anywhere.
 
-If you **cannot generate an API key** because you don't have Avoma admin access, the app has a browser-based fallback. It launches a headless Chrome window, logs in to `app.avoma.com` with your credentials, and pulls meeting data directly using your authenticated session.
+> Sessions typically stay valid for 30+ days. If it ever expires, just run `avoma-login` again.
 
+#### Option B: Ask your admin for a user-scoped API key
+
+You don't need admin access to *use* a key — only to *create* one. Ask your Avoma admin to:
+1. Go to **Avoma → Settings → Organization → Developer**
+2. Create a **"User – full access"** key assigned to your account and send it to you
+
+Then set it in `.env`:
+```env
+AVOMA_API_KEY=<the key>
+```
+
+#### Option C: Email + standalone Avoma password
+
+Only if your Avoma account has a direct password (not Google/SSO):
 ```env
 AVOMA_EMAIL=glynn@rocketlane.com
 AVOMA_PASSWORD=your_avoma_password
 ```
-
-The browser session is cached in `.avoma_session/` so subsequent runs skip the login step.
-
-> **SSO accounts (Google / Microsoft login):** If your Avoma account was created via SSO you won't have a standalone password. To enable Path B:
-> 1. Go to https://app.avoma.com/login and click **Forgot password**
-> 2. Set a standalone Avoma password
-> 3. Use that password as `AVOMA_PASSWORD`
->
-> Alternatively, ask your Avoma admin to generate a user-scoped API key (Path A) tied to your account — they create the key and hand it to you; you don't need admin access yourself to *use* a key.
 
 ---
 
 ## CLI Reference
 
 ```
-python main.py --help
+python3 main.py --help
 ```
 
 ### Task management
 
 ```bash
 # Add a task
-python main.py add "Prepare Q3 report" --priority high --date 2026-05-19
+python3 main.py add "Prepare Q3 report" --priority high --date 2026-05-19
 
 # List today's pending tasks
-python main.py list
+python3 main.py list
 
 # List all tasks for a date (including completed)
-python main.py list --all --date 2026-05-19
+python3 main.py list --all --date 2026-05-19
 
 # Mark task #3 as done
-python main.py done 3
+python3 main.py done 3
 
 # Re-open task #3
-python main.py undo 3
+python3 main.py undo 3
 
 # Edit a task
-python main.py edit 3 --title "Updated title" --priority low
+python3 main.py edit 3 --title "Updated title" --priority low
 
 # Delete a task
-python main.py delete 3
+python3 main.py delete 3
 
 # View today's completion stats
-python main.py stats
+python3 main.py stats
 ```
 
 ### Avoma integration
 
 ```bash
+# One-time login via browser (Google/SSO supported)
+python3 main.py avoma-login
+
 # Pull action items from today's completed Avoma calls and save as tasks
-python main.py sync-avoma
+python3 main.py sync-avoma
 
 # Sync a specific date
-python main.py sync-avoma --date 2026-05-17
+python3 main.py sync-avoma --date 2026-05-17
 ```
 
 ### Email
 
 ```bash
 # Send the morning email right now (for testing)
-python main.py send-morning
+python3 main.py send-morning
 
 # Send the evening wrap-up right now (for testing)
-python main.py send-evening
+python3 main.py send-evening
 ```
 
 ### Scheduler daemon
 
 ```bash
 # Start the background scheduler (runs morning + evening jobs automatically)
-python main.py start
+python3 main.py start
 ```
 
 Run `start` in a terminal multiplexer (tmux/screen) or as a systemd service so it persists after you close your shell.
@@ -167,24 +173,24 @@ sudo systemctl status daily-todo
 
 ## How Avoma integration works
 
-The app auto-selects the mode based on which credentials are present in `.env`:
+The app auto-selects the mode — no manual config needed beyond the one-time setup:
 
 | Mode | Triggered by | How it works |
 |---|---|---|
-| **API** | `AVOMA_API_KEY` is set | Direct REST calls to `api.avoma.com` |
-| **Scraper** | `AVOMA_EMAIL` + `AVOMA_PASSWORD` | Headless Chrome logs in and reuses session cookies |
-| **Disabled** | Neither set | Emails sent without Avoma data |
+| **API** | `AVOMA_API_KEY` set | Direct REST calls to `api.avoma.com` |
+| **Scraper** | Saved session OR email+password | Headless Chrome reuses your browser session |
+| **Disabled** | None of the above | Emails sent without Avoma data |
 
 ```
 Every hour (avoma_sync_job)
     └─ List completed meetings for today
     └─ For each meeting with AI notes ready
-        └─ Fetch action items (via API or browser session)
+        └─ Fetch action items (via API or browser session cookies)
         └─ Save each as a task (source=avoma, due_date=today)
         └─ Deduplication: skip if (meeting_uuid, title) already exists
 
 Morning email
-    └─ Today's meetings from Avoma (scheduled + completed)
+    └─ Today's meetings from Avoma
     └─ All pending tasks (manual + avoma-sourced)
 
 Evening email
@@ -212,13 +218,13 @@ daily-to-do/
 ├── requirements.txt
 ├── .env.example         # Config template
 ├── src/
-│   ├── config.py        # Env-var config (API key vs credentials auto-detect)
-│   ├── avoma_client.py  # Avoma REST API wrapper (Path A)
-│   ├── avoma_scraper.py # Playwright browser scraper (Path B — no admin access)
+│   ├── config.py        # Config + Avoma mode auto-detection
+│   ├── avoma_client.py  # Avoma REST API wrapper (Option B)
+│   ├── avoma_scraper.py # Playwright browser scraper (Options A & C)
 │   ├── task_manager.py  # SQLite task CRUD
 │   ├── email_sender.py  # HTML email builder + SMTP sender
 │   ├── scheduler.py     # APScheduler jobs
 │   └── cli.py           # Click CLI commands
-├── .avoma_session/      # Cached browser session (auto-created, git-ignored)
+├── .avoma_session/      # Saved browser session (auto-created, git-ignored)
 └── tasks.db             # SQLite database (auto-created)
 ```

@@ -218,6 +218,23 @@ def send_evening() -> None:
 # Daemon
 # ---------------------------------------------------------------------------
 
+@cli.command("avoma-login")
+def avoma_login() -> None:
+    """One-time Avoma login via a visible browser window (supports Google/SSO).
+
+    Opens a real browser so you can sign in with Google (or any SSO).
+    The session is saved and reused automatically — you only need to do
+    this once (or again if your session expires, typically after 30+ days).
+    """
+    from .avoma_scraper import run_manual_login  # noqa: PLC0415
+    try:
+        run_manual_login()
+        click.echo("  Avoma session saved. Run 'sync-avoma' or 'start' to use it.")
+    except Exception as e:
+        click.echo(f"  Login failed: {e}", err=True)
+        raise SystemExit(1)
+
+
 @cli.command("start")
 def start_daemon() -> None:
     """Start the scheduler daemon (blocks until stopped with Ctrl+C)."""
