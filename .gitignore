@@ -1,0 +1,11 @@
+.env
+*.db
+.avoma_session/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.DS_Store
