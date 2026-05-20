@@ -187,9 +187,14 @@ def sync_avoma(sync_date: str | None) -> None:
 
     avoma = get_avoma_source()
     tm = _tm()
-    with _avoma_ctx(avoma) as src:
-        count = _import_avoma_action_items(src, tm, from_dt, to_dt, tag_date=tag_date)
-    click.echo(f"  Synced {count} new action items from Avoma for {tag_date}.")
+    try:
+        with _avoma_ctx(avoma) as src:
+            count = _import_avoma_action_items(src, tm, from_dt, to_dt, tag_date=tag_date)
+        click.echo(f"  Synced {count} new action items from Avoma for {tag_date}.")
+    except Exception as e:
+        click.echo(f"  Avoma sync failed: {e}", err=True)
+        click.echo("  If your session expired, run: python3 main.py avoma-login", err=True)
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------

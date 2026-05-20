@@ -60,8 +60,8 @@ class Config:
 
     @classmethod
     def _avoma_session_exists(cls) -> bool:
-        """True when `avoma-login` has been run and a browser session is saved."""
-        from .avoma_scraper import SESSION_DIR, session_exists  # noqa: PLC0415
+        """True when `avoma-login` has been run and cookies have been saved."""
+        from .avoma_scraper import session_exists  # noqa: PLC0415
         return session_exists()
 
     @classmethod

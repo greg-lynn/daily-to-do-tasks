@@ -1,25 +1,23 @@
 """
 Avoma browser-based data extractor using Playwright.
 
-Two sub-modes, both transparent to the rest of the app:
+Session approach: saves cookies to .avoma_session/cookies.json after login.
+The scraper then loads those cookies into a fresh headless browser context.
+This avoids the browser-profile binary incompatibility between the headed
+(full Chromium) login browser and the headless shell used for automation.
 
-  1. SESSION mode (recommended for SSO users — Google / Microsoft login)
-     Run once:  python3 main.py avoma-login
-     A visible browser opens. You log in normally (Google SSO, click-click, done).
-     The session is saved to .avoma_session/. Every subsequent run is fully
-     headless and automatic — no passwords stored anywhere.
+Two auth sub-modes:
+  1. SESSION mode (recommended — works with Google/Microsoft SSO)
+       python3 main.py avoma-login
+     A visible browser opens. Log in via Google SSO. Cookies are saved.
+     Every subsequent run is fully headless and automatic.
 
-  2. PASSWORD mode (optional, for email+password Avoma accounts only)
-     Set AVOMA_EMAIL + AVOMA_PASSWORD in .env.
-     The scraper logs in automatically on first run and reuses the cached session.
-
-In both modes the scraper tries to make in-browser fetch() calls against
-Avoma's internal API using the authenticated session cookies, so it gets the
-same clean JSON as the official API — no DOM fragility needed for the data.
-DOM scraping is only used as a last-resort fallback.
+  2. PASSWORD mode (email + password Avoma accounts only)
+     Set AVOMA_EMAIL + AVOMA_PASSWORD in .env. Auto-logs in on first run.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -36,10 +34,10 @@ logger = logging.getLogger(__name__)
 
 _APP_URL = "https://app.avoma.com"
 _LOGIN_URL = f"{_APP_URL}/login"
-_MEETINGS_URL = f"{_APP_URL}/meetings"
 
-# Persistent browser profile — keeps cookies/session between runs
+# Directory and file where the session cookies are persisted
 SESSION_DIR = os.path.join(os.path.dirname(__file__), "..", ".avoma_session")
+COOKIES_FILE = os.path.join(SESSION_DIR, "cookies.json")
 
 
 class AvomaScraperError(Exception):
@@ -51,26 +49,36 @@ class AvomaLoginError(AvomaScraperError):
 
 
 class AvomaSessionMissingError(AvomaScraperError):
-    """Raised when there is no saved session and no credentials to auto-login."""
     pass
 
 
 def session_exists() -> bool:
-    """True if a Playwright persistent context profile has been saved."""
-    p = Path(SESSION_DIR)
-    # Chromium saves a 'Default' subfolder with cookies etc.
-    return (p / "Default").exists() or any(p.iterdir()) if p.exists() else False
+    """True if a cookies.json has been saved by avoma-login."""
+    return Path(COOKIES_FILE).exists()
+
+
+def _load_cookies() -> list[dict]:
+    try:
+        with open(COOKIES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _save_cookies(cookies: list[dict]) -> None:
+    Path(SESSION_DIR).mkdir(parents=True, exist_ok=True)
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(cookies, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
-# One-time manual login  (called by `python3 main.py avoma-login`)
+# One-time manual login (called by `python3 main.py avoma-login`)
 # ---------------------------------------------------------------------------
 
 def run_manual_login() -> None:
     """
-    Open a VISIBLE browser window so the user can log in via Google/Microsoft
-    SSO (or email+password). Once the user is past the login page, save the
-    session and close.
+    Open a VISIBLE browser so the user can log in (Google SSO, etc.).
+    Saves cookies to .avoma_session/cookies.json when done.
     """
     from playwright.sync_api import sync_playwright  # noqa: PLC0415
 
@@ -78,38 +86,33 @@ def run_manual_login() -> None:
     print("  Log in with Google (or however you normally sign in).")
     print("  The window will close automatically once you are signed in.\n")
 
-    Path(SESSION_DIR).mkdir(parents=True, exist_ok=True)
-
     with sync_playwright() as pw:
-        browser = pw.chromium.launch_persistent_context(
-            user_data_dir=SESSION_DIR,
-            headless=False,                    # VISIBLE window
-            viewport={"width": 1280, "height": 900},
-            args=["--no-sandbox"],
-        )
-        page = browser.pages[0] if browser.pages else browser.new_page()
+        browser = pw.chromium.launch(headless=False)
+        ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+        page = ctx.new_page()
         page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
 
         print("  Waiting for you to finish logging in ...")
 
-        # Poll until we land somewhere past the login page
-        for _ in range(120):   # wait up to ~2 minutes
+        # Poll until we land inside the app (not on login/auth pages)
+        for _ in range(120):
             page.wait_for_timeout(1000)
-            url = page.url
-            if _is_app_url(url):
+            if _is_app_url(page.url):
                 break
         else:
             browser.close()
-            raise AvomaLoginError(
-                "Timed out waiting for login. Please try again."
-            )
+            raise AvomaLoginError("Timed out waiting for login. Please try again.")
 
-        # Give the app a moment to fully load and set cookies
+        # Brief pause so all auth cookies are fully written
         page.wait_for_timeout(2000)
+
+        # Save cookies
+        cookies = ctx.cookies()
+        _save_cookies(cookies)
         browser.close()
 
-    print("\n  Login successful. Session saved to .avoma_session/")
-    print("  You won't need to log in again unless your session expires.\n")
+    print(f"\n  Login successful. {len(cookies)} cookies saved to .avoma_session/cookies.json")
+    print("  You won't need to log in again unless your session expires (~30 days).\n")
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +123,8 @@ class AvomaScraper:
     """
     Playwright-based Avoma data extractor.
 
-    Mirrors the public interface of AvomaClient for the methods the app needs:
-      - list_meetings(from_dt, to_dt)
-      - extract_todays_action_items(from_dt, to_dt)
-      - get_transcript(meeting_uuid)
+    Uses a standard headless browser context loaded with saved cookies —
+    no persistent profile needed, no binary compatibility issues.
 
     Context-manager usage:
         with AvomaScraper() as scraper:
@@ -135,12 +136,10 @@ class AvomaScraper:
         email: str | None = None,
         password: str | None = None,
         headless: bool = True,
-        session_dir: str | None = None,
     ):
         self._email = email or Config.AVOMA_EMAIL
         self._password = password or Config.AVOMA_PASSWORD
         self._headless = headless
-        self._session_dir = session_dir or SESSION_DIR
 
     # ------------------------------------------------------------------
     # Context manager
@@ -148,18 +147,30 @@ class AvomaScraper:
 
     def __enter__(self):
         from playwright.sync_api import sync_playwright  # noqa: PLC0415
-        Path(self._session_dir).mkdir(parents=True, exist_ok=True)
         self._pw = sync_playwright().__enter__()
-        self._browser = self._pw.chromium.launch_persistent_context(
-            user_data_dir=self._session_dir,
+        self._browser = self._pw.chromium.launch(
             headless=self._headless,
-            viewport={"width": 1280, "height": 900},
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        self._page = self._browser.pages[0] if self._browser.pages else self._browser.new_page()
+        self._ctx = self._browser.new_context(viewport={"width": 1280, "height": 900})
+
+        # Load saved cookies if available
+        cookies = _load_cookies()
+        if cookies:
+            self._ctx.add_cookies(cookies)
+            logger.info("Avoma scraper: loaded %d cookies from session file", len(cookies))
+
+        self._page = self._ctx.new_page()
         return self
 
     def __exit__(self, *_):
+        # Persist any updated cookies before closing
+        try:
+            updated = self._ctx.cookies()
+            if updated:
+                _save_cookies(updated)
+        except Exception:
+            pass
         try:
             self._browser.close()
         except Exception:
@@ -170,28 +181,28 @@ class AvomaScraper:
             pass
 
     # ------------------------------------------------------------------
-    # Login
+    # Login check / auto-login
     # ------------------------------------------------------------------
 
     def ensure_logged_in(self) -> None:
-        """Navigate to Avoma. Authenticate if needed."""
+        """Navigate to Avoma. Re-authenticate if the session has expired."""
         self._page.goto(_APP_URL, wait_until="domcontentloaded", timeout=30_000)
         _wait_settle(self._page)
 
         if _is_app_url(self._page.url):
-            logger.info("Avoma scraper: session valid, skipping login")
+            logger.info("Avoma scraper: session valid")
             return
 
-        # Session missing or expired
+        # Session expired or missing
         if self._email and self._password:
-            logger.info("Avoma scraper: logging in as %s ...", self._email)
+            logger.info("Avoma scraper: session expired, logging in with password ...")
             self._do_password_login()
         else:
             raise AvomaSessionMissingError(
-                "No saved Avoma session found and no credentials configured.\n"
+                "Avoma session has expired or is missing.\n"
                 "Run:  python3 main.py avoma-login\n"
-                "A browser window will open — log in with Google/SSO once, "
-                "and the session will be saved automatically."
+                "A browser window will open — log in with Google/SSO once "
+                "and the session will be refreshed automatically."
             )
 
     def _do_password_login(self) -> None:
@@ -204,13 +215,12 @@ class AvomaScraper:
             'button[type="submit"], button:has-text("Sign in"), '
             'button:has-text("Log in"), button:has-text("Continue")'
         )
-
         try:
             self._page.wait_for_selector(email_sel, timeout=10_000)
             self._page.fill(email_sel, self._email)
         except Exception as exc:
             raise AvomaLoginError(
-                "Could not find the email field. Your account may be SSO-only.\n"
+                "Could not find the email field — your account may be SSO-only.\n"
                 "Run:  python3 main.py avoma-login"
             ) from exc
 
@@ -219,10 +229,7 @@ class AvomaScraper:
         self._page.click(submit_sel)
 
         try:
-            self._page.wait_for_url(
-                lambda u: _is_app_url(u),
-                timeout=15_000,
-            )
+            self._page.wait_for_url(lambda u: _is_app_url(u), timeout=15_000)
         except Exception as exc:
             body = self._page.inner_text("body")
             if any(w in body.lower() for w in ("invalid", "incorrect", "wrong", "error")):
@@ -230,7 +237,9 @@ class AvomaScraper:
             raise AvomaLoginError("Avoma login timed out.") from exc
 
         _wait_settle(self._page)
-        logger.info("Avoma scraper: password login successful")
+        # Save refreshed cookies
+        _save_cookies(self._ctx.cookies())
+        logger.info("Avoma scraper: password login successful, cookies saved")
 
     # ------------------------------------------------------------------
     # Meeting list
@@ -246,25 +255,17 @@ class AvomaScraper:
         from_str = _fmt_dt(from_dt)
         to_str = _fmt_dt(to_dt)
 
-        # Try in-browser fetch first (fastest — uses session cookies, returns clean JSON)
         meetings = self._browser_fetch_meetings(from_str, to_str, page_size)
         if meetings is not None:
             return meetings
 
-        # DOM fallback
         logger.warning("Avoma scraper: falling back to DOM meeting list")
         return self._dom_meetings(from_dt, to_dt)
 
     def _browser_fetch_meetings(
         self, from_str: str, to_str: str, page_size: int
     ) -> list[AvomaMeeting] | None:
-        """Use JS fetch() with existing session cookies to call Avoma's own API."""
         try:
-            # Navigate to the app first so we're on the right origin
-            if not _is_app_url(self._page.url):
-                self._page.goto(_APP_URL, wait_until="domcontentloaded", timeout=15_000)
-                _wait_settle(self._page)
-
             result = self._page.evaluate(f"""
                 async () => {{
                     try {{
@@ -278,56 +279,49 @@ class AvomaScraper:
                 }}
             """)
             if result and "results" in result:
-                logger.info(
-                    "Avoma scraper: fetched %d meetings via in-browser API",
-                    len(result["results"]),
-                )
+                logger.info("Avoma scraper: fetched %d meetings via API", len(result["results"]))
                 from .avoma_client import _parse_meeting  # noqa: PLC0415
                 return [_parse_meeting(r) for r in result["results"]]
         except Exception:
             logger.debug("In-browser meetings fetch failed", exc_info=True)
         return None
 
-    def _dom_meetings(
-        self, from_dt: datetime, to_dt: datetime
-    ) -> list[AvomaMeeting]:
+    def _dom_meetings(self, from_dt: datetime, to_dt: datetime) -> list[AvomaMeeting]:
         from_date = from_dt.strftime("%Y-%m-%d")
         to_date = to_dt.strftime("%Y-%m-%d")
         self._page.goto(
-            f"{_MEETINGS_URL}?from={from_date}&to={to_date}",
+            f"{_APP_URL}/meetings?from={from_date}&to={to_date}",
             wait_until="domcontentloaded", timeout=30_000,
         )
         _wait_settle(self._page, extra_ms=2500)
         meetings: list[AvomaMeeting] = []
-        selectors = [
+        for sel in (
             '[data-testid*="meeting"]', '.meeting-row', '.meeting-item',
             '[class*="MeetingRow"]', '[class*="meeting-card"]',
-        ]
-        cards = []
-        for sel in selectors:
+        ):
             cards = self._page.query_selector_all(sel)
             if cards:
+                for card in cards[:50]:
+                    try:
+                        text = card.inner_text()
+                        link = card.query_selector("a")
+                        href = link.get_attribute("href") if link else ""
+                        uuid = _extract_uuid(href or "")
+                        subject = _first_line(text)
+                        meetings.append(AvomaMeeting(
+                            uuid=uuid or f"dom-{abs(hash(subject))}",
+                            subject=subject,
+                            start_at=datetime.now(timezone.utc),
+                            end_at=datetime.now(timezone.utc),
+                            attendees=[],
+                            state="completed",
+                            transcript_ready=True,
+                            notes_ready=True,
+                            transcription_uuid=None,
+                        ))
+                    except Exception:
+                        continue
                 break
-        for card in cards[:50]:
-            try:
-                text = card.inner_text()
-                link = card.query_selector("a")
-                href = link.get_attribute("href") if link else ""
-                uuid = _extract_uuid(href or "")
-                subject = _first_line(text)
-                meetings.append(AvomaMeeting(
-                    uuid=uuid or f"dom-{abs(hash(subject))}",
-                    subject=subject,
-                    start_at=datetime.now(timezone.utc),
-                    end_at=datetime.now(timezone.utc),
-                    attendees=[],
-                    state="completed",
-                    transcript_ready=True,
-                    notes_ready=True,
-                    transcription_uuid=None,
-                ))
-            except Exception:
-                continue
         return meetings
 
     # ------------------------------------------------------------------
@@ -338,13 +332,9 @@ class AvomaScraper:
         self, meeting_uuid: str, meeting_subject: str = ""
     ) -> list[AvomaActionItem]:
         self.ensure_logged_in()
-
-        # In-browser fetch (uses session cookies → clean JSON from Avoma's own API)
         items = self._browser_fetch_insights(meeting_uuid, meeting_subject)
         if items is not None:
             return items
-
-        # DOM fallback
         return self._dom_action_items(meeting_uuid, meeting_subject)
 
     def _browser_fetch_insights(
@@ -392,12 +382,9 @@ class AvomaScraper:
         )
         _wait_settle(self._page, extra_ms=2500)
         items: list[AvomaActionItem] = []
-
         for sel in (
-            '[data-note-type="action_item"]',
-            '[data-category*="action"]',
-            '.action-item',
-            '[class*="ActionItem"]',
+            '[data-note-type="action_item"]', '[data-category*="action"]',
+            '.action-item', '[class*="ActionItem"]',
         ):
             els = self._page.query_selector_all(sel)
             for el in els:
@@ -410,7 +397,6 @@ class AvomaScraper:
             if items:
                 return items
 
-        # Heading-based fallback
         for heading in ("Action Items", "Next Steps", "Follow-up"):
             try:
                 result = self._page.evaluate(f"""
@@ -446,13 +432,11 @@ class AvomaScraper:
         return items
 
     # ------------------------------------------------------------------
-    # High-level helper (same signature as AvomaClient)
+    # High-level helpers (same signature as AvomaClient)
     # ------------------------------------------------------------------
 
     def extract_todays_action_items(
-        self,
-        from_dt: datetime,
-        to_dt: datetime,
+        self, from_dt: datetime, to_dt: datetime,
     ) -> list[AvomaActionItem]:
         action_items: list[AvomaActionItem] = []
         try:
@@ -469,10 +453,6 @@ class AvomaScraper:
             except Exception:
                 logger.warning("Avoma scraper: insights failed for %s", m.uuid, exc_info=True)
         return action_items
-
-    # ------------------------------------------------------------------
-    # Transcript
-    # ------------------------------------------------------------------
 
     def get_transcript(self, meeting_uuid: str) -> AvomaTranscript | None:
         self.ensure_logged_in()
@@ -501,12 +481,6 @@ class AvomaScraper:
 # ---------------------------------------------------------------------------
 
 def get_avoma_source():
-    """
-    Returns the right Avoma data source based on available config:
-      - AvomaClient  if AVOMA_API_KEY is set
-      - AvomaScraper if AVOMA_EMAIL+PASSWORD set, or a saved session exists
-      - None otherwise
-    """
     mode = Config.avoma_mode()
     if mode == "api":
         from .avoma_client import AvomaClient  # noqa: PLC0415
@@ -525,7 +499,7 @@ def _is_app_url(url: str) -> bool:
         _APP_URL in url
         and "login" not in url
         and "signin" not in url
-        and "auth" not in url.split("?")[0]   # ignore ?... query params
+        and "auth" not in url.split("?")[0]
     )
 
 
