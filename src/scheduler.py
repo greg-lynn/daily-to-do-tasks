@@ -72,21 +72,27 @@ def morning_job() -> None:
     avoma = _get_avoma_source()
     today_iso = date.today().isoformat()
 
-    # Pull today's meetings from Avoma
+    # Pull today's meetings from Avoma (failures here must never block the email)
     meetings = []
     if avoma:
-        with _avoma_ctx(avoma) as src:
-            try:
-                from_dt, to_dt = _today_range_utc()
-                meetings = src.list_meetings(from_dt, to_dt)
-                logger.info("Fetched %d meetings from Avoma", len(meetings))
-            except Exception:
-                logger.warning("Failed to fetch Avoma meetings", exc_info=True)
-            # Also import action items from yesterday's completed meetings
-            try:
-                _import_avoma_action_items(src, tm, *_yesterday_range_utc(), tag_date=today_iso)
-            except Exception:
-                logger.warning("Failed to import Avoma action items", exc_info=True)
+        try:
+            with _avoma_ctx(avoma) as src:
+                try:
+                    from_dt, to_dt = _today_range_utc()
+                    meetings = src.list_meetings(from_dt, to_dt)
+                    logger.info("Fetched %d meetings from Avoma", len(meetings))
+                except Exception:
+                    logger.warning("Failed to fetch Avoma meetings", exc_info=True)
+                try:
+                    _import_avoma_action_items(src, tm, *_yesterday_range_utc(), tag_date=today_iso)
+                except Exception:
+                    logger.warning("Failed to import Avoma action items", exc_info=True)
+        except Exception:
+            logger.warning(
+                "Avoma browser session could not be opened — skipping Avoma sync. "
+                "Run 'python3 main.py avoma-login' to refresh the session.",
+                exc_info=True,
+            )
 
     # Fetch today's tasks
     tasks = tm.list_tasks(due_date=today_iso, include_completed=False)
@@ -104,20 +110,27 @@ def evening_job() -> None:
     avoma = _get_avoma_source()
     today_iso = date.today().isoformat()
 
-    # Pull today's completed meetings and action items
+    # Pull today's completed meetings and action items (failures must never block the email)
     meetings = []
     action_items = []
     if avoma:
-        with _avoma_ctx(avoma) as src:
-            try:
-                from_dt, to_dt = _today_range_utc()
-                meetings = src.list_meetings(from_dt, to_dt)
-                logger.info("Fetched %d meetings from Avoma", len(meetings))
-                new_count = _import_avoma_action_items(src, tm, from_dt, to_dt, tag_date=today_iso)
-                logger.info("Imported %d new Avoma action items", new_count)
-                action_items = src.extract_todays_action_items(from_dt, to_dt)
-            except Exception:
-                logger.warning("Failed to fetch Avoma data", exc_info=True)
+        try:
+            with _avoma_ctx(avoma) as src:
+                try:
+                    from_dt, to_dt = _today_range_utc()
+                    meetings = src.list_meetings(from_dt, to_dt)
+                    logger.info("Fetched %d meetings from Avoma", len(meetings))
+                    new_count = _import_avoma_action_items(src, tm, from_dt, to_dt, tag_date=today_iso)
+                    logger.info("Imported %d new Avoma action items", new_count)
+                    action_items = src.extract_todays_action_items(from_dt, to_dt)
+                except Exception:
+                    logger.warning("Failed to fetch Avoma data", exc_info=True)
+        except Exception:
+            logger.warning(
+                "Avoma browser session could not be opened — skipping Avoma sync. "
+                "Run 'python3 main.py avoma-login' to refresh the session.",
+                exc_info=True,
+            )
 
     # All tasks for today (including completed)
     tasks = tm.list_tasks(due_date=today_iso, include_completed=True)
