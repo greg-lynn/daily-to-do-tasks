@@ -1,19 +1,18 @@
 """
 Avoma browser-based data extractor using Playwright.
 
-Session approach: saves cookies to .avoma_session/cookies.json after login.
-The scraper then loads those cookies into a fresh headless browser context.
-This avoids the browser-profile binary incompatibility between the headed
-(full Chromium) login browser and the headless shell used for automation.
+Strategy: navigate to Avoma pages and INTERCEPT the network responses the
+web app makes to load its data. This is far more reliable than trying to
+call the public API from the browser (different host → cookies don't transfer)
+or scraping the DOM (fragile CSS selectors).
 
-Two auth sub-modes:
-  1. SESSION mode (recommended — works with Google/Microsoft SSO)
-       python3 main.py avoma-login
-     A visible browser opens. Log in via Google SSO. Cookies are saved.
-     Every subsequent run is fully headless and automatic.
+When the SPA loads a page it makes authenticated XHR/fetch calls to its own
+backend. We capture those responses to get clean JSON meeting/transcript data.
 
-  2. PASSWORD mode (email + password Avoma accounts only)
-     Set AVOMA_EMAIL + AVOMA_PASSWORD in .env. Auto-logs in on first run.
+As a final fallback, we read the visible transcript text from each meeting
+page and extract action items using keyword matching.
+
+Session: cookies are saved to .avoma_session/cookies.json by avoma-login.
 """
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .avoma_client import (
     AvomaMeeting, AvomaAttendee, AvomaActionItem, AvomaTranscript,
@@ -35,9 +35,33 @@ logger = logging.getLogger(__name__)
 _APP_URL = "https://app.avoma.com"
 _LOGIN_URL = f"{_APP_URL}/login"
 
-# Directory and file where the session cookies are persisted
 SESSION_DIR = os.path.join(os.path.dirname(__file__), "..", ".avoma_session")
 COOKIES_FILE = os.path.join(SESSION_DIR, "cookies.json")
+
+# Keywords used to detect action items when parsing raw transcript text
+_ACTION_PATTERNS = [
+    r"(?i)\baction item[s]?\b[:\-]?\s*(.+)",
+    r"(?i)\bnext step[s]?\b[:\-]?\s*(.+)",
+    r"(?i)\bfollow.?up[s]?\b[:\-]?\s*(.+)",
+    r"(?i)\btodo[s]?\b[:\-]?\s*(.+)",
+    r"(?i)\bto.do[s]?\b[:\-]?\s*(.+)",
+    r"(?i)^[-•*]\s*(.{10,})",            # bulleted list items
+    r"(?i)\bi(?:'ll| will| need to| am going to)\s+(.{10,})",
+    r"(?i)\bwe(?:'ll| will| need to| are going to)\s+(.{10,})",
+    r"(?i)\byou(?:'ll| will| need to| are going to)\s+(.{10,})",
+    r"(?i)\bcan you\s+(.{10,})\?",
+    r"(?i)\bplease\s+(.{10,})",
+    r"(?i)\bsend\s+(.{10,})",
+    r"(?i)\bschedule\s+(.{10,})",
+    r"(?i)\bshare\s+(.{10,})",
+    r"(?i)\bset up\s+(.{10,})",
+    r"(?i)\bbook\s+(.{10,})",
+]
+
+# Avoma internal API path patterns to intercept
+_MEETING_API_PATTERNS = ["/meetings", "/v1/meetings", "/api/meetings"]
+_TRANSCRIPT_API_PATTERNS = ["/transcription", "/transcript", "/v1/transcription"]
+_NOTES_API_PATTERNS = ["/notes", "/insights", "/v1/notes", "/v1/meetings"]
 
 
 class AvomaScraperError(Exception):
@@ -53,7 +77,6 @@ class AvomaSessionMissingError(AvomaScraperError):
 
 
 def session_exists() -> bool:
-    """True if a cookies.json has been saved by avoma-login."""
     return Path(COOKIES_FILE).exists()
 
 
@@ -72,14 +95,10 @@ def _save_cookies(cookies: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# One-time manual login (called by `python3 main.py avoma-login`)
+# One-time manual login
 # ---------------------------------------------------------------------------
 
 def run_manual_login() -> None:
-    """
-    Open a VISIBLE browser so the user can log in (Google SSO, etc.).
-    Saves cookies to .avoma_session/cookies.json when done.
-    """
     from playwright.sync_api import sync_playwright  # noqa: PLC0415
 
     print("\n  Opening Avoma login page in a browser window.")
@@ -91,27 +110,20 @@ def run_manual_login() -> None:
         ctx = browser.new_context(viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
         page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
-
         print("  Waiting for you to finish logging in ...")
-
-        # Poll until we land inside the app (not on login/auth pages)
         for _ in range(120):
             page.wait_for_timeout(1000)
             if _is_app_url(page.url):
                 break
         else:
             browser.close()
-            raise AvomaLoginError("Timed out waiting for login. Please try again.")
-
-        # Brief pause so all auth cookies are fully written
+            raise AvomaLoginError("Timed out. Please try again.")
         page.wait_for_timeout(2000)
-
-        # Save cookies
         cookies = ctx.cookies()
         _save_cookies(cookies)
         browser.close()
 
-    print(f"\n  Login successful. {len(cookies)} cookies saved to .avoma_session/cookies.json")
+    print(f"\n  Login successful. {len(cookies)} cookies saved.")
     print("  You won't need to log in again unless your session expires (~30 days).\n")
 
 
@@ -121,22 +133,13 @@ def run_manual_login() -> None:
 
 class AvomaScraper:
     """
-    Playwright-based Avoma data extractor.
-
-    Uses a standard headless browser context loaded with saved cookies —
-    no persistent profile needed, no binary compatibility issues.
-
-    Context-manager usage:
-        with AvomaScraper() as scraper:
-            meetings = scraper.list_meetings(from_dt, to_dt)
+    Playwright browser scraper. Uses network response interception so we
+    capture the same JSON the web app loads — no fragile CSS selectors,
+    no cross-origin API issues.
     """
 
-    def __init__(
-        self,
-        email: str | None = None,
-        password: str | None = None,
-        headless: bool = True,
-    ):
+    def __init__(self, email: str | None = None, password: str | None = None,
+                 headless: bool = True):
         self._email = email or Config.AVOMA_EMAIL
         self._password = password or Config.AVOMA_PASSWORD
         self._headless = headless
@@ -153,22 +156,16 @@ class AvomaScraper:
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
         self._ctx = self._browser.new_context(viewport={"width": 1280, "height": 900})
-
-        # Load saved cookies if available
         cookies = _load_cookies()
         if cookies:
             self._ctx.add_cookies(cookies)
-            logger.info("Avoma scraper: loaded %d cookies from session file", len(cookies))
-
+            logger.info("Avoma scraper: loaded %d cookies", len(cookies))
         self._page = self._ctx.new_page()
         return self
 
     def __exit__(self, *_):
-        # Persist any updated cookies before closing
         try:
-            updated = self._ctx.cookies()
-            if updated:
-                _save_cookies(updated)
+            _save_cookies(self._ctx.cookies())
         except Exception:
             pass
         try:
@@ -181,258 +178,285 @@ class AvomaScraper:
             pass
 
     # ------------------------------------------------------------------
-    # Login check / auto-login
+    # Login check
     # ------------------------------------------------------------------
 
     def ensure_logged_in(self) -> None:
-        """Navigate to Avoma. Re-authenticate if the session has expired."""
         self._page.goto(_APP_URL, wait_until="domcontentloaded", timeout=30_000)
-        _wait_settle(self._page)
-
+        _wait_settle(self._page, extra_ms=1500)
         if _is_app_url(self._page.url):
             logger.info("Avoma scraper: session valid")
             return
-
-        # Session expired or missing
         if self._email and self._password:
-            logger.info("Avoma scraper: session expired, logging in with password ...")
             self._do_password_login()
         else:
             raise AvomaSessionMissingError(
-                "Avoma session has expired or is missing.\n"
-                "Run:  python3 main.py avoma-login\n"
-                "A browser window will open — log in with Google/SSO once "
-                "and the session will be refreshed automatically."
+                "Avoma session has expired.\n"
+                "Run:  python3 main.py avoma-login"
             )
 
     def _do_password_login(self) -> None:
         self._page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
         _wait_settle(self._page)
-
-        email_sel = 'input[type="email"], input[name="email"], input[placeholder*="email" i]'
-        pwd_sel = 'input[type="password"], input[name="password"]'
-        submit_sel = (
-            'button[type="submit"], button:has-text("Sign in"), '
-            'button:has-text("Log in"), button:has-text("Continue")'
-        )
+        email_sel = 'input[type="email"], input[name="email"]'
+        pwd_sel = 'input[type="password"]'
+        submit_sel = 'button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")'
         try:
             self._page.wait_for_selector(email_sel, timeout=10_000)
             self._page.fill(email_sel, self._email)
         except Exception as exc:
-            raise AvomaLoginError(
-                "Could not find the email field — your account may be SSO-only.\n"
-                "Run:  python3 main.py avoma-login"
-            ) from exc
-
+            raise AvomaLoginError("SSO-only account — run: python3 main.py avoma-login") from exc
         self._page.wait_for_selector(pwd_sel, timeout=5_000)
         self._page.fill(pwd_sel, self._password)
         self._page.click(submit_sel)
-
         try:
             self._page.wait_for_url(lambda u: _is_app_url(u), timeout=15_000)
         except Exception as exc:
-            body = self._page.inner_text("body")
-            if any(w in body.lower() for w in ("invalid", "incorrect", "wrong", "error")):
-                raise AvomaLoginError("Avoma login failed: incorrect email or password.")
-            raise AvomaLoginError("Avoma login timed out.") from exc
-
+            raise AvomaLoginError("Login timed out.") from exc
         _wait_settle(self._page)
-        # Save refreshed cookies
         _save_cookies(self._ctx.cookies())
-        logger.info("Avoma scraper: password login successful, cookies saved")
 
     # ------------------------------------------------------------------
-    # Meeting list
+    # Meeting list via network interception
     # ------------------------------------------------------------------
 
     def list_meetings(
-        self,
-        from_dt: datetime,
-        to_dt: datetime,
-        page_size: int = 50,
+        self, from_dt: datetime, to_dt: datetime, page_size: int = 50,
     ) -> list[AvomaMeeting]:
         self.ensure_logged_in()
-        from_str = _fmt_dt(from_dt)
-        to_str = _fmt_dt(to_dt)
 
-        meetings = self._browser_fetch_meetings(from_str, to_str, page_size)
-        if meetings is not None:
-            return meetings
-
-        logger.warning("Avoma scraper: falling back to DOM meeting list")
-        return self._dom_meetings(from_dt, to_dt)
-
-    def _browser_fetch_meetings(
-        self, from_str: str, to_str: str, page_size: int
-    ) -> list[AvomaMeeting] | None:
-        try:
-            result = self._page.evaluate(f"""
-                async () => {{
-                    try {{
-                        const r = await fetch(
-                            '/v1/meetings/?from_date={from_str}&to_date={to_str}&page_size={page_size}',
-                            {{credentials: 'include'}}
-                        );
-                        if (!r.ok) return null;
-                        return await r.json();
-                    }} catch(e) {{ return null; }}
-                }}
-            """)
-            if result and "results" in result:
-                logger.info("Avoma scraper: fetched %d meetings via API", len(result["results"]))
-                from .avoma_client import _parse_meeting  # noqa: PLC0415
-                return [_parse_meeting(r) for r in result["results"]]
-        except Exception:
-            logger.debug("In-browser meetings fetch failed", exc_info=True)
-        return None
-
-    def _dom_meetings(self, from_dt: datetime, to_dt: datetime) -> list[AvomaMeeting]:
         from_date = from_dt.strftime("%Y-%m-%d")
         to_date = to_dt.strftime("%Y-%m-%d")
-        self._page.goto(
-            f"{_APP_URL}/meetings?from={from_date}&to={to_date}",
-            wait_until="domcontentloaded", timeout=30_000,
-        )
-        _wait_settle(self._page, extra_ms=2500)
+        captured: list[dict] = []
+
+        def _on_response(response):
+            try:
+                url = response.url
+                status = response.status
+                if status != 200:
+                    return
+                # Capture any response that looks like a meeting list
+                if any(p in url for p in _MEETING_API_PATTERNS):
+                    body = response.json()
+                    if isinstance(body, dict) and "results" in body:
+                        captured.extend(body["results"])
+                        logger.info("Intercepted %d meetings from %s", len(body["results"]), url)
+                    elif isinstance(body, list) and body and "uuid" in body[0]:
+                        captured.extend(body)
+                        logger.info("Intercepted %d meetings (list) from %s", len(body), url)
+            except Exception:
+                pass
+
+        self._page.on("response", _on_response)
+        try:
+            url = f"{_APP_URL}/meetings?from={from_date}&to={to_date}"
+            logger.info("Avoma scraper: navigating to %s", url)
+            self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            # Wait generously for the SPA to finish loading and making its API calls
+            _wait_settle(self._page, extra_ms=4000)
+        finally:
+            self._page.remove_listener("response", _on_response)
+
+        if captured:
+            from .avoma_client import _parse_meeting  # noqa: PLC0415
+            # Deduplicate by uuid
+            seen: set[str] = set()
+            meetings = []
+            for r in captured:
+                uid = r.get("uuid", "")
+                if uid and uid not in seen:
+                    seen.add(uid)
+                    meetings.append(_parse_meeting(r))
+            logger.info("Avoma scraper: %d meetings captured", len(meetings))
+            return meetings
+
+        logger.warning("Avoma scraper: network interception found no meetings — trying DOM fallback")
+        return self._dom_meetings_fallback()
+
+    def _dom_meetings_fallback(self) -> list[AvomaMeeting]:
+        """Read meeting links visible in the DOM as a last resort."""
         meetings: list[AvomaMeeting] = []
-        for sel in (
-            '[data-testid*="meeting"]', '.meeting-row', '.meeting-item',
-            '[class*="MeetingRow"]', '[class*="meeting-card"]',
-        ):
-            cards = self._page.query_selector_all(sel)
-            if cards:
-                for card in cards[:50]:
-                    try:
-                        text = card.inner_text()
-                        link = card.query_selector("a")
-                        href = link.get_attribute("href") if link else ""
-                        uuid = _extract_uuid(href or "")
-                        subject = _first_line(text)
-                        meetings.append(AvomaMeeting(
-                            uuid=uuid or f"dom-{abs(hash(subject))}",
-                            subject=subject,
-                            start_at=datetime.now(timezone.utc),
-                            end_at=datetime.now(timezone.utc),
-                            attendees=[],
-                            state="completed",
-                            transcript_ready=True,
-                            notes_ready=True,
-                            transcription_uuid=None,
-                        ))
-                    except Exception:
-                        continue
-                break
+        try:
+            # Collect all links on the page that look like meeting URLs
+            links = self._page.evaluate("""
+                () => {
+                    return [...document.querySelectorAll('a[href]')]
+                        .map(a => ({href: a.href, text: a.innerText.trim()}))
+                        .filter(l => /meetings\\/[0-9a-f-]{36}/.test(l.href));
+                }
+            """)
+            seen: set[str] = set()
+            for link in (links or []):
+                uuid = _extract_uuid(link.get("href", ""))
+                if uuid and uuid not in seen:
+                    seen.add(uuid)
+                    meetings.append(AvomaMeeting(
+                        uuid=uuid,
+                        subject=link.get("text") or "(meeting)",
+                        start_at=datetime.now(timezone.utc),
+                        end_at=datetime.now(timezone.utc),
+                        attendees=[],
+                        state="completed",
+                        transcript_ready=True,
+                        notes_ready=True,
+                        transcription_uuid=None,
+                    ))
+            logger.info("DOM fallback found %d meeting links", len(meetings))
+        except Exception:
+            logger.debug("DOM meetings fallback failed", exc_info=True)
         return meetings
 
     # ------------------------------------------------------------------
-    # Action items
+    # Action items via network interception + transcript parsing
     # ------------------------------------------------------------------
 
     def get_action_items(
         self, meeting_uuid: str, meeting_subject: str = ""
     ) -> list[AvomaActionItem]:
+        """
+        Navigate to the meeting detail page, intercept API responses for
+        notes/insights, and extract action items. Also parses the visible
+        transcript text as a fallback.
+        """
         self.ensure_logged_in()
-        items = self._browser_fetch_insights(meeting_uuid, meeting_subject)
-        if items is not None:
-            return items
-        return self._dom_action_items(meeting_uuid, meeting_subject)
 
-    def _browser_fetch_insights(
-        self, meeting_uuid: str, meeting_subject: str
-    ) -> list[AvomaActionItem] | None:
+        captured_notes: list[dict] = []
+        captured_transcript: list[dict] = []
+
+        def _on_response(response):
+            try:
+                url = response.url
+                if response.status != 200:
+                    return
+                if meeting_uuid not in url:
+                    return
+                body = response.json()
+                if any(p in url for p in _NOTES_API_PATTERNS):
+                    if "ai_notes" in body:
+                        captured_notes.append(body)
+                        logger.info("Intercepted notes for %s", meeting_uuid)
+                if any(p in url for p in _TRANSCRIPT_API_PATTERNS):
+                    captured_transcript.append(body)
+                    logger.info("Intercepted transcript for %s", meeting_uuid)
+            except Exception:
+                pass
+
+        self._page.on("response", _on_response)
         try:
-            result = self._page.evaluate(f"""
-                async () => {{
-                    try {{
-                        const r = await fetch(
-                            '/v1/meetings/{meeting_uuid}/insights/',
-                            {{credentials: 'include'}}
-                        );
-                        if (!r.ok) return null;
-                        return await r.json();
-                    }} catch(e) {{ return null; }}
-                }}
-            """)
-            if not result:
-                return None
+            self._page.goto(
+                f"{_APP_URL}/meetings/{meeting_uuid}",
+                wait_until="domcontentloaded", timeout=30_000,
+            )
+            _wait_settle(self._page, extra_ms=4000)
+        finally:
+            self._page.remove_listener("response", _on_response)
+
+        # 1. Try AI notes from intercepted JSON
+        items = self._action_items_from_notes(captured_notes, meeting_uuid, meeting_subject)
+        if items:
+            return items
+
+        # 2. Try transcript text from intercepted JSON
+        items = self._action_items_from_transcript_json(
+            captured_transcript, meeting_uuid, meeting_subject
+        )
+        if items:
+            return items
+
+        # 3. Read transcript text directly from the DOM
+        return self._action_items_from_dom_transcript(meeting_uuid, meeting_subject)
+
+    def _action_items_from_notes(
+        self, notes_data: list[dict], meeting_uuid: str, meeting_subject: str
+    ) -> list[AvomaActionItem]:
+        items = []
+        for data in notes_data:
             speakers = {
                 s["id"]: s.get("name", "")
-                for s in result.get("speakers", [])
+                for s in data.get("speakers", [])
             }
-            items = []
-            for note in result.get("ai_notes", []):
-                if note.get("note_type") in ("action_item", "next_step", "action"):
+            for note in data.get("ai_notes", []):
+                ntype = note.get("note_type", "")
+                if ntype in ("action_item", "next_step", "action", "follow_up"):
+                    text = note.get("text", "").strip()
+                    if text:
+                        items.append(AvomaActionItem(
+                            text=text,
+                            speaker_name=speakers.get(note.get("speaker_id", -1), ""),
+                            meeting_uuid=meeting_uuid,
+                            meeting_subject=meeting_subject,
+                        ))
+        return items
+
+    def _action_items_from_transcript_json(
+        self, transcript_data: list[dict], meeting_uuid: str, meeting_subject: str
+    ) -> list[AvomaActionItem]:
+        items = []
+        for data in transcript_data:
+            speakers = {
+                s["id"]: s.get("name", "")
+                for s in data.get("speakers", [])
+            }
+            for line in data.get("transcript", []):
+                text = line.get("transcript", "").strip()
+                extracted = _extract_action_items_from_text(text)
+                for action in extracted:
+                    spk_id = line.get("speaker_id", -1)
                     items.append(AvomaActionItem(
-                        text=note.get("text", "").strip(),
-                        speaker_name=speakers.get(note.get("speaker_id", -1), ""),
+                        text=action,
+                        speaker_name=speakers.get(spk_id, ""),
                         meeting_uuid=meeting_uuid,
                         meeting_subject=meeting_subject,
                     ))
-            return items
-        except Exception:
-            logger.debug("In-browser insights fetch failed for %s", meeting_uuid, exc_info=True)
-            return None
+        return items
 
-    def _dom_action_items(
+    def _action_items_from_dom_transcript(
         self, meeting_uuid: str, meeting_subject: str
     ) -> list[AvomaActionItem]:
-        self._page.goto(
-            f"{_APP_URL}/meetings/{meeting_uuid}",
-            wait_until="domcontentloaded", timeout=30_000,
-        )
-        _wait_settle(self._page, extra_ms=2500)
-        items: list[AvomaActionItem] = []
-        for sel in (
-            '[data-note-type="action_item"]', '[data-category*="action"]',
-            '.action-item', '[class*="ActionItem"]',
-        ):
-            els = self._page.query_selector_all(sel)
-            for el in els:
-                text = el.inner_text().strip()
-                if text and len(text) > 5:
+        """Extract all transcript text from the DOM and run keyword matching."""
+        items = []
+        try:
+            # Grab all text that looks like transcript content
+            texts = self._page.evaluate("""
+                () => {
+                    // Try specific transcript containers first
+                    const selectors = [
+                        '[class*="transcript"]',
+                        '[class*="Transcript"]',
+                        '[data-testid*="transcript"]',
+                        '[class*="note"]',
+                        '[class*="Note"]',
+                        '[class*="summary"]',
+                    ];
+                    for (const sel of selectors) {
+                        const els = document.querySelectorAll(sel);
+                        if (els.length > 0) {
+                            return [...els].map(e => e.innerText).join('\\n');
+                        }
+                    }
+                    // Fallback: grab the main content area
+                    const main = document.querySelector('main') ||
+                                 document.querySelector('[role="main"]') ||
+                                 document.body;
+                    return main ? main.innerText : '';
+                }
+            """)
+            if texts:
+                extracted = _extract_action_items_from_text(texts)
+                for action in extracted:
                     items.append(AvomaActionItem(
-                        text=text, meeting_uuid=meeting_uuid,
+                        text=action,
+                        meeting_uuid=meeting_uuid,
                         meeting_subject=meeting_subject,
                     ))
-            if items:
-                return items
-
-        for heading in ("Action Items", "Next Steps", "Follow-up"):
-            try:
-                result = self._page.evaluate(f"""
-                    () => {{
-                        const hdrs = [...document.querySelectorAll(
-                            'h1,h2,h3,h4,h5,strong,[class*="heading"],[class*="title"]'
-                        )];
-                        const hdr = hdrs.find(
-                            el => el.innerText && el.innerText.trim().toLowerCase()
-                                     .includes('{heading.lower()}')
-                        );
-                        if (!hdr) return [];
-                        const out = [];
-                        let el = (hdr.parentElement || hdr).nextElementSibling;
-                        for (let i = 0; i < 20 && el; i++, el = el.nextElementSibling) {{
-                            const t = (el.innerText || '').trim();
-                            if (t) out.push(t);
-                        }}
-                        return out;
-                    }}
-                """)
-                for text in (result or []):
-                    text = text.strip()
-                    if text and len(text) > 5:
-                        items.append(AvomaActionItem(
-                            text=text, meeting_uuid=meeting_uuid,
-                            meeting_subject=meeting_subject,
-                        ))
-                if items:
-                    break
-            except Exception:
-                continue
+                logger.info("DOM transcript fallback: %d action items for %s",
+                            len(items), meeting_uuid)
+        except Exception:
+            logger.debug("DOM transcript fallback failed", exc_info=True)
         return items
 
     # ------------------------------------------------------------------
-    # High-level helpers (same signature as AvomaClient)
+    # High-level helpers
     # ------------------------------------------------------------------
 
     def extract_todays_action_items(
@@ -444,35 +468,47 @@ class AvomaScraper:
         except Exception:
             logger.warning("Avoma scraper: failed to list meetings", exc_info=True)
             return action_items
-        for m in meetings:
-            if not m.notes_ready:
-                continue
+        completed = [m for m in meetings if m.state in ("completed", "")]
+        logger.info("Avoma scraper: processing %d completed meetings for action items",
+                    len(completed))
+        for m in completed:
             try:
                 items = self.get_action_items(m.uuid, m.subject)
+                logger.info("  %s → %d action items", m.subject[:50], len(items))
                 action_items.extend(items)
             except Exception:
-                logger.warning("Avoma scraper: insights failed for %s", m.uuid, exc_info=True)
+                logger.warning("  Failed for %s", m.uuid, exc_info=True)
         return action_items
 
     def get_transcript(self, meeting_uuid: str) -> AvomaTranscript | None:
         self.ensure_logged_in()
+        captured: list[dict] = []
+
+        def _on_response(response):
+            try:
+                if response.status == 200 and any(
+                    p in response.url for p in _TRANSCRIPT_API_PATTERNS
+                ):
+                    captured.append(response.json())
+            except Exception:
+                pass
+
+        self._page.on("response", _on_response)
         try:
-            result = self._page.evaluate(f"""
-                async () => {{
-                    const r = await fetch(
-                        '/v1/transcriptions/?meeting_uuid={meeting_uuid}',
-                        {{credentials: 'include'}}
-                    );
-                    if (!r.ok) return null;
-                    const d = await r.json();
-                    return Array.isArray(d) ? d[0] : d;
-                }}
-            """)
-            if result:
-                from .avoma_client import _parse_transcript  # noqa: PLC0415
-                return _parse_transcript(result)
-        except Exception:
-            logger.debug("Scraper transcript fetch failed for %s", meeting_uuid, exc_info=True)
+            self._page.goto(
+                f"{_APP_URL}/meetings/{meeting_uuid}",
+                wait_until="domcontentloaded", timeout=30_000,
+            )
+            _wait_settle(self._page, extra_ms=3000)
+        finally:
+            self._page.remove_listener("response", _on_response)
+
+        if captured:
+            from .avoma_client import _parse_transcript  # noqa: PLC0415
+            try:
+                return _parse_transcript(captured[0])
+            except Exception:
+                pass
         return None
 
 
@@ -491,6 +527,35 @@ def get_avoma_source():
 
 
 # ---------------------------------------------------------------------------
+# Transcript text → action item extractor
+# ---------------------------------------------------------------------------
+
+def _extract_action_items_from_text(text: str) -> list[str]:
+    """
+    Scan a block of text for sentences that look like action items.
+    Returns deduplicated list of action item strings.
+    """
+    items: list[str] = []
+    seen: set[str] = set()
+    lines = text.splitlines()
+    for line in lines:
+        line = line.strip()
+        if len(line) < 10 or len(line) > 300:
+            continue
+        for pattern in _ACTION_PATTERNS:
+            m = re.search(pattern, line)
+            if m:
+                # Use the capture group if present, otherwise the full line
+                action = (m.group(1) if m.lastindex else line).strip()
+                action = re.sub(r"\s+", " ", action).strip(" .,;:")
+                if len(action) >= 10 and action.lower() not in seen:
+                    seen.add(action.lower())
+                    items.append(action)
+                break  # only extract once per line
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -505,7 +570,7 @@ def _is_app_url(url: str) -> bool:
 
 def _wait_settle(page, extra_ms: int = 500) -> None:
     try:
-        page.wait_for_load_state("networkidle", timeout=8_000)
+        page.wait_for_load_state("networkidle", timeout=10_000)
     except Exception:
         pass
     if extra_ms:
